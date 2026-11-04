@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from foot_cv.pipeline import run
-from foot_cv.render import render
+from src.pipeline import run
+from src.render import render
 
 
 def main() -> None:

@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 from ultralytics import YOLO
 
-from foot_cv.homography import ViewTransformer
-from foot_cv.pitch import Pitch
-from foot_cv.teams import TeamClassifier, shirt_feature, shirt_pixels
+from .homography import ViewTransformer
+from .pitch import Pitch
+from .teams import TeamClassifier, shirt_feature, shirt_pixels
 
 PLAYER_CLASSES = {1: "goalkeeper", 2: "player", 3: "referee"}  # class 0 (ball) comes from the ball model
 

@@ -4,8 +4,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from foot_cv.pipeline import TrackingResult
-from foot_cv.pitch import EDGES, Pitch, PitchCanvas
+from .pipeline import TrackingResult
+from .pitch import EDGES, Pitch, PitchCanvas
 
 REFEREE_COLOUR = (0, 220, 255)
 UNKNOWN_COLOUR = (160, 160, 160)

@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from foot_cv.diagnostics import Report, diagnose
+from src.diagnostics import Report, diagnose
 
 
 def plot_overview(report: Report, tracking: pd.DataFrame, fps: float, path: Path) -> None:
@@ -49,7 +49,7 @@ def plot_overview(report: Report, tracking: pd.DataFrame, fps: float, path: Path
 
 
 def plot_speeds(tracking: pd.DataFrame, fps: float, path: Path) -> None:
-    from foot_cv.diagnostics import MAX_HUMAN_SPEED, SPRINT_SPEED, add_speed
+    from src.diagnostics import MAX_HUMAN_SPEED, SPRINT_SPEED, add_speed
     p = add_speed(tracking[tracking.cls == "player"], fps)
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.hist(p.speed.dropna().clip(upper=20), bins=80, color="tab:blue")
