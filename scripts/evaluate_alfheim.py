@@ -58,8 +58,37 @@ def match(gt: pd.DataFrame, people: pd.DataFrame, gate: float) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True)
 
 
-def score(gt: pd.DataFrame, people: pd.DataFrame) -> dict:
-    """Match rates are reported next to a chance level: the same matching against detections taken
+TRACKING_GATE = 2.0  # m; per-player tracking stats only count matches this close (well above chance)
+
+
+def per_player(m2: pd.DataFrame, home: float, fps: float) -> pd.DataFrame:
+    """Tracking quality per real (sensor) player, from matches within TRACKING_GATE.
+
+    main_id_share: share of the player's matched time covered by his most common track ID (1.0 = never
+    lost); ids_over_10pct: track IDs that cover at least 10% of it (1 = ideal); wrong_team: share of
+    matched frames where his detection carried the other team's label.
+    """
+    rows = []
+    for tag, g in m2.groupby("tag"):
+        hit = g.dropna(subset=["track_id"])
+        ids = hit.track_id.value_counts(normalize=True)
+        rows.append({
+            "tag": int(tag),
+            "seconds_on_pitch": len(g) / fps,
+            "share_found_within_2m": len(hit) / len(g),
+            "error_median_m": hit.err.median() if len(hit) else np.nan,
+            "main_id_share": ids.iloc[0] if len(ids) else np.nan,
+            "ids_over_10pct": int((ids >= 0.1).sum()),
+            "ids_total": len(ids),
+            "wrong_team": float((hit.team != home).mean()) if len(hit) else np.nan,
+        })
+    return pd.DataFrame(rows).round(3)
+
+
+def score(gt: pd.DataFrame, people: pd.DataFrame, fps: float) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """Summary, per-player table and frame-by-frame matches (9 m gate).
+
+    Match rates are reported next to a chance level: the same matching against detections taken
     from half a clip away. Players bunch together, so a loose gate matches by luck; only the margin
     over chance reflects real accuracy."""
     n = int(people.frame.max()) + 1
@@ -70,21 +99,25 @@ def score(gt: pd.DataFrame, people: pd.DataFrame) -> dict:
     for gate in (2.0, 5.0, 9.0):
         real = match(gt, people, gate).err.notna().mean()
         chance = match(gt, shifted, gate).err.notna().mean()
-        s[f"found_within_{gate:.0f}m (chance)"] = f"{real:.0%} ({chance:.0%})"
+        s[f"found_within_{gate:.0f}m"] = round(float(real), 3)
+        s[f"found_within_{gate:.0f}m_by_chance"] = round(float(chance), 3)
     s |= {
         "error_median_m": round(float(hit.err.median()), 2) if len(hit) else None,
         "error_p90_m": round(float(hit.err.quantile(0.9)), 2) if len(hit) else None,
     }
+    players = pd.DataFrame()
     if len(hit) > 20:
         home = hit.team.mode()[0]
+        players = per_player(match(gt, people, TRACKING_GATE), home, fps)
         s["home_team_label_correct"] = round(float((hit.team == home).mean()), 3)
-        s["ids_per_real_player_median"] = float(hit.groupby("tag").track_id.nunique().median())
+        s["main_id_share_median"] = round(float(players.main_id_share.median()), 3)
+        s["ids_over_10pct_median"] = float(players.ids_over_10pct.median())
         A = np.c_[hit.gx, hit.gy, np.ones(len(hit))]
         cx = np.linalg.lstsq(A, hit.x_m.astype(float), rcond=None)[0]
         cy = np.linalg.lstsq(A, hit.y_m.astype(float), rcond=None)[0]
         s["fit_x"] = f"x_det = {cx[0]:.2f}*x {cx[1]:+.2f}*y {cx[2]:+.1f}"
         s["fit_y"] = f"y_det = {cy[0]:+.2f}*x {cy[1]:.2f}*y {cy[2]:+.1f}"
-    return s
+    return s, players, m
 
 
 def find_offset(csv: Path, t0: pd.Timestamp, fps: float, people: pd.DataFrame, flip_x: bool, flip_y: bool,
@@ -118,7 +151,9 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("out_dirs", nargs="+", type=Path)
     p.add_argument("--gt", type=Path, default=Path("data/raw/alfheim/2013-11-03_tromso_stromsgodset_raw_first.csv"))
-    p.add_argument("--offset", type=float, default=1.8, help="sensor clock minus video clock, seconds")
+    p.add_argument("--offset", type=float, default=3.4,
+                   help="sensor clock minus video clock, seconds (3.4 measured on minutes 3, 10, 25 and 40 "
+                        "of the 2013-11-03 first half)")
     p.add_argument("--flip-x", action="store_true")
     p.add_argument("--no-flip-y", dest="flip_y", action="store_false")
     p.add_argument("--merge", nargs="*", default=[], help="also score these views combined (by camera name)")
@@ -144,7 +179,16 @@ def main() -> None:
               f"within 1.5 m {b.within_1_5m:.0%}  -> {out / 'alignment.csv'}")
         return
 
-    results, views = {}, {}
+    settings = {"offset_s": args.offset, "flip_x": args.flip_x, "flip_y": args.flip_y, "gt": str(args.gt)}
+
+    def save(out: Path, suffix: str, s: dict, players: pd.DataFrame, matches: pd.DataFrame) -> None:
+        out.mkdir(exist_ok=True)
+        (out / f"summary{suffix}.json").write_text(json.dumps(settings | s, indent=2))
+        players.to_csv(out / f"per_player{suffix}.csv", index=False)
+        matches.to_parquet(out / f"matches{suffix}.parquet", index=False)
+        print(f"saved -> {out}/{{summary,per_player,matches}}{suffix}.*")
+
+    results, views, dirs = {}, {}, {}
     for d in args.out_dirs:
         meta = json.loads((d / "meta.json").read_text())
         clip = json.loads(Path(meta["video"]).with_suffix(".json").read_text())
@@ -153,17 +197,23 @@ def main() -> None:
         n_frames = int(tracking.frame.max()) + 1
         gt = load_gt(args.gt, t0, n_frames, fps, args.offset, args.flip_x, args.flip_y)
         people = tracking[tracking.cls != "ball"]
-        views[clip["camera"]] = (gt, people)
-        results[clip["camera"]] = score(gt, people)
+        cam = clip["camera"]
+        views[cam], dirs[cam] = (gt, people, fps), d
+        s, players, matches = score(gt, people, fps)
+        save(d / "evaluation", "", s, players, matches)
+        results[cam] = s
 
     if args.merge:
-        gt = views[args.merge[0]][0]
+        gt, _, fps = views[args.merge[0]]
         merged = pd.concat([views[c][1].assign(track_id=views[c][1].track_id + 100_000 * i)
                             for i, c in enumerate(args.merge)])
-        results["merged(" + "+".join(args.merge) + ")"] = score(gt, merged)
+        name = "+".join(args.merge)
+        s, players, matches = score(gt, merged, fps)
+        save(dirs[args.merge[0]] / "evaluation", f"_merged_{name}", s, players, matches)
+        results[f"merged({name})"] = s
 
-    table = pd.DataFrame(results)
-    print(table.to_string())
+    print(f"offset {args.offset:+.1f} s, flip_x={args.flip_x}, flip_y={args.flip_y}")
+    print(pd.DataFrame(results).to_string())
 
 
 if __name__ == "__main__":
