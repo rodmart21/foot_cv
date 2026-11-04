@@ -76,8 +76,15 @@ def download_camera(args, camera: str, begin: pd.Timestamp) -> None:
         for f in files:
             out.write(f.read_bytes())
 
+    # Raw .h264 has no timing, so OpenCV reports a default 25 fps. The real rate is frames per chunk
+    # over the chunk length: 90 frames / 3 s = 30 fps for the single cameras, 75 / 3 = 25 for the panorama.
+    probe = cv2.VideoCapture(str(files[0]))
+    frames_in_chunk = 0
+    while probe.grab():
+        frames_in_chunk += 1
+    fps = frames_in_chunk / CHUNK_SECONDS
+
     cap = cv2.VideoCapture(str(joined))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     ok, frame = cap.read()
     h, w = frame.shape[:2]
     size = (args.width, round(h * args.width / w / 2) * 2) if args.width else (w, h)

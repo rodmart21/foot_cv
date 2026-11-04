@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .homography import Calibration
 from .pipeline import TrackingResult
 from .pitch import EDGES, Pitch, PitchCanvas
 
@@ -17,19 +18,33 @@ def _colour(row, team_colours) -> tuple[int, int, int]:
     return team_colours.get(int(row.team), UNKNOWN_COLOUR)
 
 
-def _draw_pitch_lines(frame: np.ndarray, H: np.ndarray, pitch: Pitch) -> None:
-    """Re-project the pitch model into the image: if the lines sit on the real ones, H is good."""
-    H_inv = np.linalg.inv(H)
+def _draw_pitch_lines(frame: np.ndarray, H: np.ndarray, pitch: Pitch,
+                      calibration: Calibration | None = None) -> None:
+    """Re-project the pitch model into the image: if the lines sit on the real ones, H is good.
+    With a calibration, lines go through its lens model, so they curve like the real ones."""
+    if calibration is not None:
+        project = calibration.to_image
+    else:
+        H_inv = np.linalg.inv(H)
+        project = lambda pts: cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
+    h, w = frame.shape[:2]
+
+    def draw(pts_m: np.ndarray) -> None:
+        # Only draw runs of points that land near the frame: pitch parts far outside the view
+        # (or behind the camera) project to huge or invalid coordinates.
+        p = project(pts_m)
+        ok = np.isfinite(p).all(1) & (p[:, 0] > -w) & (p[:, 0] < 2 * w) & (p[:, 1] > -h) & (p[:, 1] < 2 * h)
+        runs = np.split(np.arange(len(p)), np.flatnonzero(np.diff(ok.astype(int))) + 1)
+        for run in runs:
+            if ok[run[0]] and len(run) > 1:
+                cv2.polylines(frame, [p[run].astype(np.int32)], False, (255, 0, 255), 2, cv2.LINE_AA)
+
     v = pitch.vertices
     for a, b in EDGES:
-        seg = np.linspace(v[a - 1], v[b - 1], 20).reshape(-1, 1, 2)
-        pts = cv2.perspectiveTransform(seg, H_inv).reshape(-1, 2).astype(np.int32)
-        cv2.polylines(frame, [pts], False, (255, 0, 255), 2, cv2.LINE_AA)
-    circle = np.array([[pitch.length / 2 + pitch.centre_circle_radius * np.cos(a),
-                        pitch.width / 2 + pitch.centre_circle_radius * np.sin(a)]
-                       for a in np.linspace(0, 2 * np.pi, 60)], dtype=np.float32).reshape(-1, 1, 2)
-    pts = cv2.perspectiveTransform(circle, H_inv).reshape(-1, 2).astype(np.int32)
-    cv2.polylines(frame, [pts], True, (255, 0, 255), 2, cv2.LINE_AA)
+        draw(np.linspace(v[a - 1], v[b - 1], 40).astype(np.float32))
+    draw(np.array([[pitch.length / 2 + pitch.centre_circle_radius * np.cos(a),
+                    pitch.width / 2 + pitch.centre_circle_radius * np.sin(a)]
+                   for a in np.linspace(0, 2 * np.pi, 61)], dtype=np.float32))
 
 
 def render(video: Path, result: TrackingResult, out_path: Path, show_pitch_lines: bool = True) -> None:
@@ -49,7 +64,7 @@ def render(video: Path, result: TrackingResult, out_path: Path, show_pitch_lines
             break
         H = result.homographies[frame_idx] if frame_idx < len(result.homographies) else None
         if show_pitch_lines and H is not None and not np.isnan(H).any():
-            _draw_pitch_lines(frame, H, canvas.pitch)
+            _draw_pitch_lines(frame, H, canvas.pitch, result.calibration)
 
         rows = by_frame.get(frame_idx)
         radar_points, ball_xy = [], None

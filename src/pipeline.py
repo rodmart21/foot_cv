@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from ultralytics import YOLO
 
-from .homography import ViewTransformer
+from .homography import Calibration, ViewTransformer
 from .pitch import Pitch
 from .teams import TeamClassifier, shirt_feature, shirt_pixels
 
@@ -35,15 +35,21 @@ class TrackingResult:
     homographies: np.ndarray      # (n_frames, 3, 3), NaN where no valid fit yet
     team_colours: dict[int, tuple[int, int, int]]
     fps: float
+    calibration: Calibration | None = None   # set when a manual calibration replaced the pitch model
 
 
 def extract(video: Path, models: Models, device: str, pitch_stride: int = 5,
-            conf: float = 0.3, ball_conf: float = 0.2) -> tuple[pd.DataFrame, list, np.ndarray, float]:
-    """Single inference pass over the video. Returns raw rows, shirt features, homographies, fps."""
+            conf: float = 0.3, ball_conf: float = 0.2,
+            homography: np.ndarray | None = None) -> tuple[pd.DataFrame, list, np.ndarray, float]:
+    """Single inference pass over the video. Returns raw rows, shirt features, homographies, fps.
+
+    homography: fixed image->pitch transform from a manual calibration; skips the pitch model.
+    """
     cap = cv2.VideoCapture(str(video))
     fps = cap.get(cv2.CAP_PROP_FPS)
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     view = ViewTransformer(Pitch().vertices)
+    view.H = homography
     rows, features, homographies = [], [], []
 
     for frame_idx in range(n_frames):
@@ -51,7 +57,7 @@ def extract(video: Path, models: Models, device: str, pitch_stride: int = 5,
         if not ok:
             break
 
-        if frame_idx % pitch_stride == 0:
+        if homography is None and frame_idx % pitch_stride == 0:
             kp = models.pitch.predict(frame, conf=conf, device=device, verbose=False)[0].keypoints
             if kp is not None and len(kp.xy):
                 view.update(kp.xy[0].cpu().numpy(), kp.conf[0].cpu().numpy())
@@ -162,22 +168,37 @@ def postprocess(df: pd.DataFrame, fps: float, max_ball_speed: float = 40.0, max_
     return out.sort_values(["frame", "track_id"]).reset_index(drop=True)
 
 
+def reproject(raw: pd.DataFrame, calibration: Calibration) -> pd.DataFrame:
+    """Recompute pitch positions from the stored pixel anchors with a fixed calibration."""
+    raw = raw.copy()
+    raw[["x_m", "y_m"]] = calibration.to_pitch(raw[["px", "py"]].to_numpy()).astype("float64")
+    return raw
+
+
 def run(video: Path, models_dir: Path, device: str, pitch_stride: int = 5,
-        cache_dir: Path | None = None) -> TrackingResult:
-    """cache_dir: if set, raw inference output is stored there and reused on the next run."""
+        cache_dir: Path | None = None, calibration: Calibration | None = None) -> TrackingResult:
+    """cache_dir: if set, raw inference output is stored there and reused on the next run.
+    calibration: fixed camera calibration; positions are recomputed from pixels, so a cache made
+    without it is reused.
+    """
+    homography = calibration.H if calibration is not None else None
     cache = cache_dir / "raw_inference.pkl" if cache_dir else None
     if cache and cache.exists():
         print(f"1/3 reusing cached inference from {cache}")
         raw, features, homographies, fps = pd.read_pickle(cache)
     else:
-        print("1/3 detection + tracking + pitch keypoints")
-        raw, features, homographies, fps = extract(video, Models.load(models_dir), device, pitch_stride)
+        print("1/3 detection + tracking" + (" (fixed calibration)" if homography is not None else " + pitch keypoints"))
+        raw, features, homographies, fps = extract(video, Models.load(models_dir), device, pitch_stride,
+                                                   homography=homography)
         if cache:
             pd.to_pickle((raw, features, homographies, fps), cache)
+    if calibration is not None:
+        raw = reproject(raw, calibration)
+        homographies = np.repeat(homography[None], len(homographies), axis=0)
     print("2/3 team assignment")
     df, team_colours = assign_teams(raw, features)
     print("3/3 smoothing + ball cleanup")
     df = postprocess(df, fps)
     cols = ["frame", "t", "track_id", "cls", "team", "team_raw", "conf", "x_m", "y_m", "px", "py",
             "x1", "y1", "x2", "y2", "interpolated"]
-    return TrackingResult(df[cols], homographies, team_colours, fps)
+    return TrackingResult(df[cols], homographies, team_colours, fps, calibration)

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from src.homography import Calibration
 from src.pipeline import run
 from src.render import render
 
@@ -20,6 +21,8 @@ def main() -> None:
     p.add_argument("--pitch-stride", type=int, default=5, help="re-estimate the homography every N frames")
     p.add_argument("--no-video", action="store_true", help="skip rendering the annotated video")
     p.add_argument("--fresh", action="store_true", help="ignore cached inference and rerun the models")
+    p.add_argument("--calibration", type=Path, default=None,
+                   help="calibration json from calibrate_camera.py; replaces the pitch keypoint model")
     args = p.parse_args()
 
     out = args.out or Path("outputs") / args.video.stem
@@ -28,7 +31,8 @@ def main() -> None:
     if args.fresh:
         (out / "raw_inference.pkl").unlink(missing_ok=True)
     start = time.time()
-    result = run(args.video, args.models, args.device, args.pitch_stride, cache_dir=out)
+    calibration = Calibration.load(args.calibration) if args.calibration else None
+    result = run(args.video, args.models, args.device, args.pitch_stride, cache_dir=out, calibration=calibration)
     result.tracking.to_parquet(out / "tracking.parquet", index=False)
     np.save(out / "homographies.npy", result.homographies)
     (out / "meta.json").write_text(json.dumps(
