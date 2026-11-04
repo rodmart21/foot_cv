@@ -19,7 +19,7 @@ def main() -> None:
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(args.start * fps))
 
     args.target.parent.mkdir(parents=True, exist_ok=True)
-    out = cv2.VideoWriter(str(args.target), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    out = cv2.VideoWriter(str(args.target), cv2.VideoWriter_fourcc(*"avc1"), fps, size)
     for _ in range(int(args.duration * fps)):
         ok, frame = cap.read()
         if not ok:

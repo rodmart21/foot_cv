@@ -35,7 +35,8 @@ def _draw_pitch_lines(frame: np.ndarray, H: np.ndarray, pitch: Pitch) -> None:
 def render(video: Path, result: TrackingResult, out_path: Path, show_pitch_lines: bool = True) -> None:
     cap = cv2.VideoCapture(str(video))
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), result.fps, (w, h))
+    # H.264 so the output plays in VS Code, browsers and QuickTime.
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"avc1"), result.fps, (w, h))
     canvas = PitchCanvas()
     radar_w = w // 3
     radar_h = int(radar_w * canvas.size[1] / canvas.size[0])
