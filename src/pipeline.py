@@ -110,6 +110,7 @@ def assign_teams(df: pd.DataFrame, features: list) -> tuple[pd.DataFrame, dict]:
     labels = TeamClassifier().fit(X).predict(X)
     df["team"] = -1
     df.loc[players, "team"] = labels
+    df["team_raw"] = df["team"]  # per-detection vote, kept to measure team consistency
     votes = df[players].groupby("track_id")["team"].agg(lambda s: s.mode().iat[0])
     is_player = df["cls"] == "player"
     df.loc[is_player, "team"] = df.loc[is_player, "track_id"].map(votes).fillna(-1).astype(int)
@@ -177,6 +178,6 @@ def run(video: Path, models_dir: Path, device: str, pitch_stride: int = 5,
     df, team_colours = assign_teams(raw, features)
     print("3/3 smoothing + ball cleanup")
     df = postprocess(df, fps)
-    cols = ["frame", "t", "track_id", "cls", "team", "conf", "x_m", "y_m", "px", "py",
+    cols = ["frame", "t", "track_id", "cls", "team", "team_raw", "conf", "x_m", "y_m", "px", "py",
             "x1", "y1", "x2", "y2", "interpolated"]
     return TrackingResult(df[cols], homographies, team_colours, fps)
