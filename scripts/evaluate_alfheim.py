@@ -147,6 +147,45 @@ def find_offset(csv: Path, t0: pd.Timestamp, fps: float, people: pd.DataFrame, f
     return table, float(fine.loc[fine.median_dist_m.idxmin(), "offset_s"])
 
 
+def snapshots(out: Path, clip: dict, video: Path, tracking: pd.DataFrame, gt: pd.DataFrame,
+              team_colours: dict, n: int = 3) -> None:
+    """Images of a few frames: our detections (team-coloured ellipses) with the sensor positions
+    (green circles, labelled by sensor tag) projected into the camera through its calibration.
+    If the clock offset and calibration are right, the circles sit at the players' feet."""
+    import cv2
+    from src.homography import Calibration
+    calibs = sorted(video.parent.glob(f"{clip['match']}_{clip['half']}_{clip['camera']}_*.calibration.json"))
+    if not calibs:
+        print(f"no calibration found for camera {clip['camera']}, skipping snapshots")
+        return
+    calib = Calibration.load(calibs[0])
+    n_frames = int(tracking.frame.max()) + 1
+    cap = cv2.VideoCapture(str(video))
+    for f in np.linspace(0, n_frames - 1, n + 2, dtype=int)[1:-1]:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(f))
+        ok, img = cap.read()
+        if not ok:
+            continue
+        for r in tracking[(tracking.frame == f) & (tracking.cls != "ball")].itertuples():
+            colour = (0, 220, 255) if r.cls == "referee" else tuple(team_colours.get(str(int(r.team)), (160, 160, 160)))
+            w = max(int(r.x2 - r.x1), 8)
+            cv2.ellipse(img, (int(r.px), int(r.py)), (w, max(int(0.35 * w), 3)), 0, -45, 235, colour, 2, cv2.LINE_AA)
+        g = gt[gt.frame == f]
+        for (x, y), tag in zip(calib.to_image(g[["gx", "gy"]].to_numpy()), g.tag):
+            if np.isfinite(x) and 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+                cv2.circle(img, (int(x), int(y)), 9, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(img, str(int(tag)), (int(x) + 10, int(y) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.rectangle(img, (0, 0), (img.shape[1], 30), (0, 0, 0), -1)
+        cv2.putText(img, f"camera {clip['camera']}, frame {f}: green = sensor positions (labelled by tag), "
+                         f"ellipses = our detections", (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        folder = out / "snapshots"
+        folder.mkdir(exist_ok=True)
+        cv2.imwrite(str(folder / f"sensors_vs_detections_frame{f}.jpg"), img)
+    print(f"snapshots -> {out}/snapshots/sensors_vs_detections_frame*.jpg")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("out_dirs", nargs="+", type=Path)
@@ -160,6 +199,8 @@ def main() -> None:
     p.add_argument("--find-offset", action="store_true",
                    help="search the sensor clock offset using all given dirs together (same clip, calibrated "
                         "cameras); saves <first dir>/evaluation/alignment.csv")
+    p.add_argument("--snapshots", action="store_true",
+                   help="also save 3 images per camera with sensor positions drawn over our detections")
     args = p.parse_args()
 
     if args.find_offset:
@@ -197,10 +238,12 @@ def main() -> None:
         n_frames = int(tracking.frame.max()) + 1
         gt = load_gt(args.gt, t0, n_frames, fps, args.offset, args.flip_x, args.flip_y)
         people = tracking[tracking.cls != "ball"]
-        cam = clip["camera"]
+        cam = meta.get("camera", clip["camera"])   # "merged" for merge_cameras.py output
         views[cam], dirs[cam] = (gt, people, fps), d
         s, players, matches = score(gt, people, fps)
         save(d / "evaluation", "", s, players, matches)
+        if args.snapshots and cam != "merged":   # a merged table is not tied to one camera image
+            snapshots(d / "evaluation", clip, Path(meta["video"]), tracking, gt, meta["team_colours_bgr"])
         results[cam] = s
 
     if args.merge:
