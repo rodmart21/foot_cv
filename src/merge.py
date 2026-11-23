@@ -18,6 +18,7 @@ from scipy.optimize import linear_sum_assignment
 
 GATE = 2.0           # m; two cameras' detections closer than this in the same frame are one player
 MIN_LINK_FRAMES = 5  # frames two tracks must be paired before they are treated as the same player
+MAX_CONFLICT_FRAMES = 3  # cannot-link tolerance: frames two groups may share a camera (stray duplicates)
 
 
 def load_views(dirs: list[Path]) -> tuple[pd.DataFrame, dict]:
@@ -109,11 +110,12 @@ def link_tracks(people: pd.DataFrame, pairs: dict) -> tuple[pd.Series, dict]:
     # per group: set of (camera, frame) it occupies
     occupied = {uid: set(zip(g.camera, g.frame)) for uid, g in people.groupby("uid")}
     accepted = rejected = 0
-    for _, a, b in candidates:
+    for n, a, b in candidates:
         ra, rb = uf.find(a), uf.find(b)
         if ra == rb:
             continue
-        if occupied[ra] & occupied[rb]:
+        # a few conflicting frames are stray duplicate boxes, not two players; only veto real overlap
+        if len(occupied[ra] & occupied[rb]) > min(MAX_CONFLICT_FRAMES, n // 5):
             rejected += 1
             continue
         uf.union(ra, rb)
@@ -148,10 +150,13 @@ def deduplicate(people: pd.DataFrame, pairs: dict, image_size: tuple[int, int]) 
     w, h = image_size
     r2 = ((people.px - w / 2) / (w / 2)) ** 2 + ((people.py - h / 2) / (h / 2)) ** 2
     people = people.assign(weight=1.0 / (0.1 + r2))
+    # When a frame's rows carry different merged ids, keep the id with the most frames in the whole clip.
+    # A per-frame pick (most rows in this frame) ties 1-1 between two cameras and flips id every frame.
+    id_length = people.groupby("merged_id").frame.nunique()
 
     def collapse(g: pd.DataFrame) -> pd.Series:
         wsum = g.weight.sum()
-        main = g.merged_id.value_counts().index[0]
+        main = id_length.loc[g.merged_id.unique()].idxmax()
         return pd.Series({
             "frame": g.frame.iat[0], "t": g.t.iat[0], "track_id": main,
             "cls": g.cls.mode().iat[0], "team": g.loc[g.merged_id == main, "team"].iat[0],
@@ -171,11 +176,57 @@ def merge_ball(balls: pd.DataFrame) -> pd.DataFrame:
         ["frame", "t", "track_id", "cls", "team", "conf", "x_m", "y_m", "camera", "n_cameras", "source_ids"]]
 
 
+SAME_CAMERA_GAP = 1.5   # m; two detections of one camera this close, with nested boxes, are one person
+NESTED_CONTAIN = 0.6
+
+
+def dedupe_within_camera(people: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Safety net for duplicates the detector's filter missed: within one camera and frame, a box mostly
+    inside another and standing within SAME_CAMERA_GAP on the pitch is dropped (the larger box is kept)."""
+    drop = []
+    for _, g in people.groupby(["camera", "frame"]):
+        if len(g) < 2:
+            continue
+        b = g[["x1", "y1", "x2", "y2"]].to_numpy()
+        area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        ix = np.clip(np.minimum(b[:, None, 2], b[None, :, 2]) - np.maximum(b[:, None, 0], b[None, :, 0]), 0, None)
+        iy = np.clip(np.minimum(b[:, None, 3], b[None, :, 3]) - np.maximum(b[:, None, 1], b[None, :, 1]), 0, None)
+        contain = ix * iy / np.maximum(area[None, :], 1e-6)      # [i, j]: share of box j inside box i
+        gap = np.hypot(g.x_m.to_numpy()[:, None] - g.x_m.to_numpy()[None], g.y_m.to_numpy()[:, None] - g.y_m.to_numpy()[None])
+        nested = (contain > NESTED_CONTAIN) & (gap < SAME_CAMERA_GAP) & (area[None, :] < area[:, None])
+        drop += list(g.index[nested.any(axis=0)])
+    return people.drop(index=drop), len(drop)
+
+
+def assign_goalkeepers(people: pd.DataFrame, pitch_length: float = 105.0) -> tuple[pd.Series, dict]:
+    """A goalkeeper belongs to the team defending the goal he stands near, not to his shirt colour
+    (keepers wear their own kit, which the colour clustering cannot place).
+
+    Which team defends which goal: the team whose outfield players sit further towards a goal on
+    average defends it (each team's block is shifted towards its own half)."""
+    outfield = people[(people.cls == "player") & (people.team >= 0)]
+    if outfield.team.nunique() < 2:
+        return people.team, {"goalkeepers": 0}
+    left_team = int(outfield.groupby("team").x_m.median().idxmin())
+    keeper_share = people.groupby("merged_id").cls.agg(lambda s: (s == "goalkeeper").mean())
+    keepers = keeper_share[keeper_share > 0.5].index
+    team = people.team.copy()
+    changed = 0
+    for mid in keepers:
+        sel = people.merged_id == mid
+        new = left_team if people.loc[sel, "x_m"].median() < pitch_length / 2 else 1 - left_team
+        changed += int((team[sel] != new).sum())
+        team[sel] = new
+    return team, {"goalkeepers": int(len(keepers)), "left_goal_defended_by_team": left_team,
+                  "goalkeeper_rows_relabelled": changed}
+
+
 def merge(dirs: list[Path], reference: str = "1", image_size: tuple[int, int] = (1280, 960)
           ) -> tuple[pd.DataFrame, dict, dict]:
     """Merged tracking table, merge report and merged team colours (BGR)."""
     rows, metas = load_views(dirs)
     people = rows[rows.cls != "ball"].dropna(subset=["x_m"]).copy()
+    people, same_camera_duplicates = dedupe_within_camera(people)
     cams = sorted(people.camera.unique())
     pairs = {(a, b): pair_detections(people, a, b) for i, a in enumerate(cams) for b in cams[i + 1:]}
     pairs = {k: v for k, v in pairs.items() if len(v)}
@@ -197,6 +248,7 @@ def merge(dirs: list[Path], reference: str = "1", image_size: tuple[int, int] = 
     before = {k: float((people.loc[p.idx_a, "team"].to_numpy() != people.loc[p.idx_b, "team"].to_numpy()).mean())
               for k, p in pairs.items()}
     people["team"] = resolve_teams(people)
+    people["team"], keeper_stats = assign_goalkeepers(people)
     after = {k: float((people.loc[p.idx_a, "team"].to_numpy() != people.loc[p.idx_b, "team"].to_numpy()).mean())
              for k, p in pairs.items()}
 
@@ -208,6 +260,8 @@ def merge(dirs: list[Path], reference: str = "1", image_size: tuple[int, int] = 
     report = {
         "cameras": cams, "reference_camera": reference, "labels_flipped": flipped,
         "team_alignment": team_stats,
+        "same_camera_duplicates_removed": same_camera_duplicates,
+        "goalkeepers": keeper_stats,
         "duplicates_per_frame": {f"{a}-{b}": round(len(p) / people.frame.nunique(), 2) for (a, b), p in pairs.items()},
         "median_gap_between_cameras_m": {f"{a}-{b}": round(float(p.dist.median()), 2) for (a, b), p in pairs.items()},
         "track_links": links,

@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from src.merge import merge
+from src.stitch import join_tracks
 
 
 def main() -> None:
@@ -16,9 +17,14 @@ def main() -> None:
     p.add_argument("dirs", nargs="+", type=Path, help="pipeline output dirs of the same clip, one per camera")
     p.add_argument("--reference", default="1", help="camera whose team labels the others are aligned to")
     p.add_argument("--out", type=Path, default=None)
+    p.add_argument("--join-gap", type=float, default=2.0,
+                   help="join track pieces of the same player separated by up to this many seconds (0 = off)")
     args = p.parse_args()
 
     tracking, report, colours = merge(args.dirs, args.reference)
+    if args.join_gap > 0:
+        fps = json.loads((args.dirs[0] / "meta.json").read_text())["fps"]
+        tracking, report["track_joining"] = join_tracks(tracking, fps, args.join_gap)
 
     # e.g. 2013-11-03_first_0_600s_9s -> 2013-11-03_first_merged_600s_9s
     parts = args.dirs[0].name.split("_")

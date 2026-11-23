@@ -12,6 +12,36 @@ from .pitch import Pitch
 from .teams import TeamClassifier, shirt_feature, shirt_pixels
 
 PLAYER_CLASSES = {1: "goalkeeper", 2: "player", 3: "referee"}  # class 0 (ball) comes from the ball model
+GOALKEEPER_SHARE = 0.2  # share of a track's detections classed goalkeeper that makes it a goalkeeper
+
+# Duplicate suppression (the detector sometimes boxes one person twice, mostly light kits at night):
+NMS_IOU = 0.5          # boxes overlapping more than this are one detection (Ultralytics default 0.7)
+NESTED_CONTAIN = 0.6   # a box this much inside another ...
+NESTED_FEET = 0.1      # ... with its bottom edge within this fraction of the big box's height ...
+NESTED_CENTRE = 0.3    # ... and its centre within this fraction of the big box's width is the same person
+
+
+def drop_nested_duplicates(xyxy: np.ndarray) -> np.ndarray:
+    """Keep-mask removing boxes nested in a larger one that stands on the same spot (same feet).
+
+    A smaller box inside a bigger one with the same bottom edge is the same person boxed twice (e.g.
+    without the head). A player standing behind another has his feet higher in the image and is kept.
+    """
+    keep = np.ones(len(xyxy), dtype=bool)
+    area = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+    for big in np.argsort(-area):
+        if not keep[big]:
+            continue
+        b = xyxy[big]
+        h, w = b[3] - b[1], b[2] - b[0]
+        ix = np.clip(np.minimum(b[2], xyxy[:, 2]) - np.maximum(b[0], xyxy[:, 0]), 0, None)
+        iy = np.clip(np.minimum(b[3], xyxy[:, 3]) - np.maximum(b[1], xyxy[:, 1]), 0, None)
+        nested = ((ix * iy / np.maximum(area, 1e-6) > NESTED_CONTAIN)
+                  & (np.abs(xyxy[:, 3] - b[3]) < NESTED_FEET * h)
+                  & (np.abs((xyxy[:, 0] + xyxy[:, 2]) / 2 - (b[0] + b[2]) / 2) < NESTED_CENTRE * w)
+                  & (area < area[big]))
+        keep &= ~nested
+    return keep
 
 
 @dataclass
@@ -64,13 +94,14 @@ def extract(video: Path, models: Models, device: str, pitch_stride: int = 5,
         homographies.append(view.H if view.H is not None else np.full((3, 3), np.nan))
 
         res = models.players.track(frame, persist=True, tracker="bytetrack.yaml", imgsz=1280,
-                                   conf=conf, device=device, verbose=False)[0]
+                                   conf=conf, iou=NMS_IOU, agnostic_nms=True, device=device, verbose=False)[0]
         if res.boxes.id is not None:
             xyxy = res.boxes.xyxy.cpu().numpy()
             cls_ids = res.boxes.cls.cpu().numpy().astype(int)
             ids = res.boxes.id.cpu().numpy().astype(int)
             confs = res.boxes.conf.cpu().numpy()
             keep = np.isin(cls_ids, list(PLAYER_CLASSES))
+            keep[keep] = drop_nested_duplicates(xyxy[keep])
             xyxy, cls_ids, ids, confs = xyxy[keep], cls_ids[keep], ids[keep], confs[keep]
             feet = np.stack([(xyxy[:, 0] + xyxy[:, 2]) / 2, xyxy[:, 3]], axis=1)
             pitch_xy = view.transform(feet)
@@ -107,8 +138,12 @@ def assign_teams(df: pd.DataFrame, features: list) -> tuple[pd.DataFrame, dict]:
     """Cluster outfield players into 2 teams, vote per track, then attach goalkeepers by position."""
     df = df.copy()
     people = df["cls"] != "ball"
-    # The detector can flicker between player/goalkeeper/referee: take each track's majority class.
-    df.loc[people, "cls"] = df[people].groupby("track_id")["cls"].transform(lambda s: s.mode().iat[0])
+    # The detector can flicker between player/goalkeeper/referee: take each track's majority class,
+    # except that a track is a goalkeeper once GOALKEEPER_SHARE of its detections say so (keepers are
+    # often half-classified as players, while outfield tracks almost never get goalkeeper votes).
+    def track_class(s: pd.Series) -> str:
+        return "goalkeeper" if (s == "goalkeeper").mean() >= GOALKEEPER_SHARE else s.mode().iat[0]
+    df.loc[people, "cls"] = df[people].groupby("track_id")["cls"].transform(track_class)
 
     feat_ok = np.array([f is not None for f in features])
     players = (df["cls"] == "player").to_numpy() & feat_ok
@@ -168,6 +203,26 @@ def postprocess(df: pd.DataFrame, fps: float, max_ball_speed: float = 40.0, max_
     return out.sort_values(["frame", "track_id"]).reset_index(drop=True)
 
 
+def recompute_shirt_features(video: Path, raw: pd.DataFrame) -> tuple[pd.DataFrame, list]:
+    """Shirt colour features for every cached detection, re-read from the video with the current
+    teams.py settings, so changing the colour method never needs the detection models rerun."""
+    raw = raw.copy()
+    features = [None] * len(raw)
+    people = raw.index[raw.cls != "ball"]
+    by_frame = raw.loc[people].groupby("frame").groups
+    cap = cv2.VideoCapture(str(video))
+    for frame_idx in range(int(raw.frame.max()) + 1):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for i in by_frame.get(frame_idx, []):
+            pixels = shirt_pixels(frame, raw.loc[i, ["x1", "y1", "x2", "y2"]].to_numpy(float))
+            bgr = pixels.mean(0) if len(pixels) else np.full(3, np.nan)
+            raw.loc[i, ["shirt_b", "shirt_g", "shirt_r"]] = bgr
+            features[raw.index.get_loc(i)] = shirt_feature(pixels)
+    return raw, features
+
+
 def reproject(raw: pd.DataFrame, calibration: Calibration) -> pd.DataFrame:
     """Recompute pitch positions from the stored pixel anchors with a fixed calibration."""
     raw = raw.copy()
@@ -184,8 +239,9 @@ def run(video: Path, models_dir: Path, device: str, pitch_stride: int = 5,
     homography = calibration.H if calibration is not None else None
     cache = cache_dir / "raw_inference.pkl" if cache_dir else None
     if cache and cache.exists():
-        print(f"1/3 reusing cached inference from {cache}")
-        raw, features, homographies, fps = pd.read_pickle(cache)
+        print(f"1/3 reusing cached inference from {cache} (shirt colours re-read from the video)")
+        raw, _, homographies, fps = pd.read_pickle(cache)
+        raw, features = recompute_shirt_features(video, raw)
     else:
         print("1/3 detection + tracking" + (" (fixed calibration)" if homography is not None else " + pitch keypoints"))
         raw, features, homographies, fps = extract(video, Models.load(models_dir), device, pitch_stride,

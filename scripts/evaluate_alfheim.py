@@ -85,6 +85,29 @@ def per_player(m2: pd.DataFrame, home: float, fps: float) -> pd.DataFrame:
     return pd.DataFrame(rows).round(3)
 
 
+def best_id_coverage(gt: pd.DataFrame, people: pd.DataFrame, gate: float = TRACKING_GATE) -> pd.Series:
+    """Per sensor player: share of his on-pitch frames in which his single best track ID is within `gate`.
+
+    Fairer than main_id_share: it does not depend on which nearby detection the per-frame matching
+    picks, so a crowd around a well-tracked player does not count as ID breaks (similar to IDF1 recall).
+    Its ceiling is the share of frames where any detection is within the gate.
+    """
+    by_frame = dict(tuple(people.dropna(subset=["x_m"]).groupby("frame")))
+    near = []
+    for f, s in gt.groupby("frame"):
+        g = by_frame.get(f)
+        if g is None:
+            continue
+        d = np.hypot(s.gx.to_numpy()[:, None] - g.x_m.to_numpy()[None], s.gy.to_numpy()[:, None] - g.y_m.to_numpy()[None])
+        i, j = np.where(d < gate)
+        near.append(pd.DataFrame({"tag": s.tag.to_numpy()[i], "frame": f, "track_id": g.track_id.to_numpy()[j]}))
+    if not near:
+        return pd.Series(dtype=float)
+    n = pd.concat(near).drop_duplicates()
+    best = n.groupby(["tag", "track_id"]).frame.nunique().groupby("tag").max()
+    return (best / gt.groupby("tag").size()).reindex(gt.tag.unique()).fillna(0)
+
+
 def score(gt: pd.DataFrame, people: pd.DataFrame, fps: float) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """Summary, per-player table and frame-by-frame matches (9 m gate).
 
@@ -111,6 +134,9 @@ def score(gt: pd.DataFrame, people: pd.DataFrame, fps: float) -> tuple[dict, pd.
         players = per_player(match(gt, people, TRACKING_GATE), home, fps)
         s["home_team_label_correct"] = round(float((hit.team == home).mean()), 3)
         s["main_id_share_median"] = round(float(players.main_id_share.median()), 3)
+        coverage = best_id_coverage(gt, people)
+        players["best_id_coverage"] = players.tag.map(coverage).round(3)
+        s["best_id_coverage_median"] = round(float(coverage.median()), 3)
         s["ids_over_10pct_median"] = float(players.ids_over_10pct.median())
         A = np.c_[hit.gx, hit.gy, np.ones(len(hit))]
         cx = np.linalg.lstsq(A, hit.x_m.astype(float), rcond=None)[0]
