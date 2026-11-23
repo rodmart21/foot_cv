@@ -41,11 +41,12 @@ def main() -> None:
     p.add_argument("--clip", default="600s_9s")
     p.add_argument("--match", default="2013-11-03_first")
     p.add_argument("--update", action="store_true", help="overwrite the row with this label instead of appending")
+    p.add_argument("--root", type=Path, default=OUT, help="folder holding the clip's output dirs")
     args = p.parse_args()
 
     row = {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "label": args.label, "clip": args.clip}
     for cam in ("0", "1"):
-        d = OUT / f"{args.match}_{cam}_{args.clip}"
+        d = args.root / f"{args.match}_{cam}_{args.clip}"
         t = pd.read_parquet(d / "tracking.parquet")
         colours = json.loads((d / "meta.json").read_text())["team_colours_bgr"]
         tromso = int(max(colours, key=lambda k: sum(colours[k])))   # lighter kit
@@ -53,7 +54,7 @@ def main() -> None:
         row[f"cam{cam}_tromso_per_frame"] = round(people[people.team == tromso].groupby("frame").size().mean(), 2)
         row[f"cam{cam}_nested_pairs_per_frame"] = round(nested_pairs_per_frame(t), 2)
 
-    m = OUT / f"{args.match}_merged_{args.clip}"
+    m = args.root / f"{args.match}_merged_{args.clip}"
     merged = pd.read_parquet(m / "tracking.parquet")
     row["merged_people_per_frame"] = float(merged[merged.cls != "ball"].groupby("frame").size().median())
     s = json.loads((m / "evaluation" / "summary.json").read_text())
@@ -82,7 +83,7 @@ def main() -> None:
     row["merged_home_label_per_frame"] = round(len(home_rows) / n, 2)
     row["merged_home_label_no_sensor_near"] = round(far / n, 2)
 
-    log = OUT / "metrics_log.csv"
+    log = OUT / "metrics_log.csv"   # always the main log, whatever --root is
     df = pd.read_csv(log) if log.exists() else pd.DataFrame()
     if args.update and len(df) and (df.label == args.label).any():
         for k, v in row.items():
